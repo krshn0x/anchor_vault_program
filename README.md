@@ -30,7 +30,22 @@ NO_DNA=1 cargo fmt --all --check
 LiteSVM: the locally generated deployment keypair currently has a different
 address. Align the deployment keypair and declared program address before deploying.
 
-The tests load `target/deploy/q3_26_vault.so` at runtime, so rebuild after changing
-program code. They cover the full lifecycle, rent preservation, invalid amounts,
-unauthorized access, account substitution, duplicate initialization, prefunded
-vaults, and reopening after closure. All transactions run inside LiteSVM.
+The 16 integration tests in `programs/q3_26_vault/tests/test_initialize.rs` load
+`target/deploy/q3_26_vault.so` at runtime, so rebuild after changing program code.
+They cover the full lifecycle, rent preservation, invalid amounts, unauthorized
+access, account and program substitution, duplicate initialization, prefunded
+vaults, reopening after closure, repeated deposits, insufficient wallet funds,
+transaction rollback, and isolation between users sharing one VM. All transactions
+run inside LiteSVM.
+
+To run just the LiteSVM suite after building:
+
+```sh
+NO_DNA=1 cargo test --test test_initialize --locked
+```
+
+## Test results
+
+All **17 tests pass**: 16 LiteSVM integration tests and 1 program-ID unit test.
+
+![Terminal screenshot showing all 17 vault tests passing with zero failures](docs/screenshots/tests-passing.jpg)

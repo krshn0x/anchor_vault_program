@@ -19,9 +19,18 @@ const DEPOSIT_LAMPORTS: u64 = 500_000_000;
 const WITHDRAW_LAMPORTS: u64 = 100_000_000;
 
 fn send(svm: &mut LiteSVM, payer: &Keypair, ix: Instruction) -> TransactionResult {
+    send_instructions(svm, payer, &[ix])
+}
+
+fn send_instructions(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    instructions: &[Instruction],
+) -> TransactionResult {
     // Repeated instructions must get distinct signatures, including failed attempts.
     svm.expire_blockhash();
-    let msg = Message::new_with_blockhash(&[ix], Some(&payer.pubkey()), &svm.latest_blockhash());
+    let msg =
+        Message::new_with_blockhash(instructions, Some(&payer.pubkey()), &svm.latest_blockhash());
     let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[payer]).unwrap();
     svm.send_transaction(tx)
 }
@@ -275,7 +284,12 @@ fn owner_signature_is_required() {
         .airdrop(&attacker.pubkey(), 1_000_000_000)
         .unwrap();
     let balance = fixture.vault_balance();
-    for mut ix in [fixture.withdraw_ix(1), fixture.close_ix()] {
+    for mut ix in [
+        fixture.initialize_ix(),
+        fixture.deposit_ix(1),
+        fixture.withdraw_ix(1),
+        fixture.close_ix(),
+    ] {
         ix.accounts[0].is_signer = false;
         assert_custom_error(
             send(&mut fixture.svm, &attacker, ix),
@@ -362,4 +376,221 @@ fn initialization_preserves_prefunded_vault_balance() {
         "a prefunded vault must not charge rent twice"
     );
     fixture.execute(fixture.close_ix()).unwrap();
+}
+
+#[test]
+fn repeated_deposits_debit_the_wallet_and_preserve_state() {
+    let mut fixture = VaultFixture::initialized();
+    let rent = fixture.vault_balance();
+    let state_before = fixture.svm.get_account(&fixture.vault_state).unwrap();
+    let mut deposited = 0;
+
+    for amount in [1, DEPOSIT_LAMPORTS, WITHDRAW_LAMPORTS] {
+        let user_before = fixture.svm.get_balance(&fixture.user.pubkey()).unwrap();
+        let result = fixture.execute(fixture.deposit_ix(amount)).unwrap();
+        deposited += amount;
+        assert_eq!(fixture.vault_balance(), rent + deposited);
+        assert_eq!(
+            fixture.svm.get_balance(&fixture.user.pubkey()).unwrap(),
+            user_before - amount - result.fee
+        );
+        assert_eq!(
+            fixture.svm.get_account(&fixture.vault_state).unwrap(),
+            state_before
+        );
+    }
+}
+
+#[test]
+fn insufficient_wallet_funds_do_not_change_the_vault() {
+    let mut fixture = VaultFixture::initialized();
+    let vault_before = fixture.svm.get_account(&fixture.vault).unwrap();
+    let state_before = fixture.svm.get_account(&fixture.vault_state).unwrap();
+    let user_before = fixture.svm.get_balance(&fixture.user.pubkey()).unwrap();
+    let err = fixture
+        .execute(fixture.deposit_ix(user_before + 1))
+        .expect_err("depositing more than the wallet balance must fail");
+
+    assert!(
+        err.meta
+            .logs
+            .iter()
+            .any(|log| log.contains("insufficient lamports")),
+        "expected the System Program's insufficient-funds error: {:?}",
+        err.meta.logs
+    );
+    assert_eq!(
+        fixture.svm.get_account(&fixture.vault).unwrap(),
+        vault_before
+    );
+    assert_eq!(
+        fixture.svm.get_account(&fixture.vault_state).unwrap(),
+        state_before
+    );
+    assert_eq!(
+        fixture.svm.get_balance(&fixture.user.pubkey()).unwrap(),
+        user_before - err.meta.fee,
+        "a failed transaction charges only the transaction fee"
+    );
+    fixture.execute(fixture.deposit_ix(1)).unwrap();
+}
+
+#[test]
+fn failed_withdrawal_rolls_back_a_deposit_in_the_same_transaction() {
+    let mut fixture = VaultFixture::initialized();
+    let vault_before = fixture.svm.get_account(&fixture.vault).unwrap();
+    let state_before = fixture.svm.get_account(&fixture.vault_state).unwrap();
+    let user_before = fixture.svm.get_balance(&fixture.user.pubkey()).unwrap();
+    let instructions = [
+        fixture.deposit_ix(DEPOSIT_LAMPORTS),
+        fixture.withdraw_ix(DEPOSIT_LAMPORTS + 1),
+    ];
+    let err = send_instructions(&mut fixture.svm, &fixture.user, &instructions)
+        .expect_err("the second instruction must fail and roll back the first");
+
+    assert_eq!(
+        err.err,
+        TransactionError::InstructionError(
+            1,
+            InstructionError::Custom(ErrorCode::InsufficientFunds.into())
+        )
+    );
+    assert_eq!(
+        fixture.svm.get_account(&fixture.vault).unwrap(),
+        vault_before
+    );
+    assert_eq!(
+        fixture.svm.get_account(&fixture.vault_state).unwrap(),
+        state_before
+    );
+    assert_eq!(
+        fixture.svm.get_balance(&fixture.user.pubkey()).unwrap(),
+        user_before - err.meta.fee
+    );
+}
+
+#[test]
+fn two_users_have_independent_vaults_in_the_same_vm() {
+    let mut alice = VaultFixture::initialized();
+    let bob = VaultFixture::new();
+    // Both users' transactions below run in Alice's VM and share its ledger.
+    alice
+        .svm
+        .airdrop(&bob.user.pubkey(), 2_000_000_000)
+        .unwrap();
+    send(&mut alice.svm, &bob.user, bob.initialize_ix()).unwrap();
+    alice.execute(alice.deposit_ix(DEPOSIT_LAMPORTS)).unwrap();
+    send(&mut alice.svm, &bob.user, bob.deposit_ix(WITHDRAW_LAMPORTS)).unwrap();
+    let bob_vault_before = alice.svm.get_account(&bob.vault).unwrap();
+    let bob_state_before = alice.svm.get_account(&bob.vault_state).unwrap();
+    let alice_balance = alice.vault_balance();
+
+    for mut ix in [alice.deposit_ix(1), alice.withdraw_ix(1), alice.close_ix()] {
+        ix.accounts[1].pubkey = bob.vault_state;
+        assert_custom_error(
+            alice.execute(ix),
+            anchor_lang::error::ErrorCode::ConstraintSeeds.into(),
+        );
+        assert_eq!(alice.vault_balance(), alice_balance);
+        assert_eq!(alice.svm.get_account(&bob.vault).unwrap(), bob_vault_before);
+        assert_eq!(
+            alice.svm.get_account(&bob.vault_state).unwrap(),
+            bob_state_before
+        );
+    }
+
+    alice.execute(alice.withdraw_ix(DEPOSIT_LAMPORTS)).unwrap();
+    alice.execute(alice.close_ix()).unwrap();
+    assert_eq!(alice.vault_balance(), 0);
+    assert_eq!(alice.svm.get_account(&bob.vault).unwrap(), bob_vault_before);
+    assert_eq!(
+        alice.svm.get_account(&bob.vault_state).unwrap(),
+        bob_state_before
+    );
+
+    send(
+        &mut alice.svm,
+        &bob.user,
+        bob.withdraw_ix(WITHDRAW_LAMPORTS),
+    )
+    .unwrap();
+    assert_eq!(
+        alice.svm.get_balance(&bob.vault).unwrap(),
+        alice.svm.minimum_balance_for_rent_exemption(0)
+    );
+    send(&mut alice.svm, &bob.user, bob.close_ix()).unwrap();
+    assert!(alice.svm.get_account(&bob.vault_state).is_none());
+    assert_eq!(alice.svm.get_balance(&bob.vault).unwrap_or(0), 0);
+}
+
+#[test]
+fn an_executable_program_cannot_replace_the_system_program() {
+    let mut fixture = VaultFixture::initialized();
+    let vault_before = fixture.svm.get_account(&fixture.vault).unwrap();
+    let state_before = fixture.svm.get_account(&fixture.vault_state).unwrap();
+
+    for mut ix in [
+        fixture.deposit_ix(1),
+        fixture.withdraw_ix(1),
+        fixture.close_ix(),
+    ] {
+        ix.accounts[3].pubkey = q3_26_vault::id();
+        assert_custom_error(
+            fixture.execute(ix),
+            anchor_lang::error::ErrorCode::InvalidProgramId.into(),
+        );
+        assert_eq!(
+            fixture.svm.get_account(&fixture.vault).unwrap(),
+            vault_before
+        );
+        assert_eq!(
+            fixture.svm.get_account(&fixture.vault_state).unwrap(),
+            state_before
+        );
+    }
+}
+
+#[test]
+fn operations_require_initialization_even_when_the_vault_is_prefunded() {
+    let mut fixture = VaultFixture::new();
+    fixture
+        .svm
+        .airdrop(&fixture.vault, DEPOSIT_LAMPORTS)
+        .unwrap();
+
+    for ix in [
+        fixture.deposit_ix(1),
+        fixture.withdraw_ix(1),
+        fixture.close_ix(),
+    ] {
+        assert_custom_error(
+            fixture.execute(ix),
+            anchor_lang::error::ErrorCode::AccountNotInitialized.into(),
+        );
+        assert_eq!(fixture.vault_balance(), DEPOSIT_LAMPORTS);
+        assert!(fixture.svm.get_account(&fixture.vault_state).is_none());
+    }
+}
+
+#[test]
+fn initialization_tops_up_only_the_missing_rent() {
+    let mut fixture = VaultFixture::new();
+    let rent = fixture.svm.minimum_balance_for_rent_exemption(0);
+    let prefunded = rent / 2;
+    // Inject a below-rent balance to exercise initialization's partial top-up path.
+    let mut vault_account = fixture.svm.get_account(&fixture.user.pubkey()).unwrap();
+    vault_account.lamports = prefunded;
+    fixture
+        .svm
+        .set_account(fixture.vault, vault_account)
+        .unwrap();
+    let user_before = fixture.svm.get_balance(&fixture.user.pubkey()).unwrap();
+
+    let result = fixture.execute(fixture.initialize_ix()).unwrap();
+    let state = fixture.svm.get_account(&fixture.vault_state).unwrap();
+    assert_eq!(fixture.vault_balance(), rent);
+    assert_eq!(
+        fixture.svm.get_balance(&fixture.user.pubkey()).unwrap(),
+        user_before - state.lamports - (rent - prefunded) - result.fee
+    );
 }
