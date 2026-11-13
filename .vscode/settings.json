@@ -1,0 +1,8 @@
+{
+    // Keep the analyzer server in sync with the VS Code extension.
+    "rust-analyzer.server.path": "${workspaceFolder}/.vscode/rust-analyzer.sh",
+    // Analyze against current standard-library sources; CLI builds stay pinned.
+    "rust-analyzer.server.extraEnv": {
+        "RUSTUP_TOOLCHAIN": "stable"
+    }
+}

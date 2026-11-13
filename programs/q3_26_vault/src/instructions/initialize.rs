@@ -33,17 +33,21 @@ pub struct Initialize<'info> {
 impl<'info> Initialize<'info> {
     pub fn initialize(&mut self, bumps: &InitializeBumps) -> Result<()> {
         let rent_exempt = Rent::get()?.minimum_balance(self.vault.data_len());
+        let top_up = rent_exempt.saturating_sub(self.vault.lamports());
 
-        let cpi_program = self.system_program.key();
+        // Anyone can pre-fund a PDA; only charge the missing rent reserve.
+        if top_up > 0 {
+            let cpi_program = self.system_program.key();
 
-        let cpi_accounts = Transfer {
-            from: self.user.to_account_info(),
-            to: self.vault.to_account_info(),
-        };
+            let cpi_accounts = Transfer {
+                from: self.user.to_account_info(),
+                to: self.vault.to_account_info(),
+            };
 
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+            let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
 
-        transfer(cpi_ctx, rent_exempt)?;
+            transfer(cpi_ctx, top_up)?;
+        }
 
         self.vault_state.vault_bump = bumps.vault;
         self.vault_state.state_bump = bumps.vault_state;
